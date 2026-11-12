@@ -1,0 +1,10 @@
+# Images and archives are built artifacts
+*.sif
+*.sif.partial
+*.tar
+*.tar.zst
+
+# Slurm logs land in the submit directory
+slurm-*.out
+
+.DS_Store

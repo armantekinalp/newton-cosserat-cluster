@@ -1,0 +1,78 @@
+# Apptainer recipe for the DAIC image.
+#
+# DAIC disables user namespaces, so the image cannot be built there. Build it on a
+# DelftBlue LOGIN node (which supports --fakeroot) and copy the .sif to DAIC:
+#   DEF=daic/newton-cosserat.def OUTPUT=/scratch/$USER/containers/newton-cosserat-daic.sif \
+#       bash delftblue/build_sif.sh
+# See daic/README.md. %files paths are relative to the newton-cosserat checkout, where
+# build_sif.sh runs the build.
+#
+# Everything comes from uv.lock except JAX's GPU backend: DAIC's NVIDIA driver (550,
+# CUDA <= 12.4) cannot run the CUDA 13 JAX plugin from the `cuda13` extra, so the image
+# installs `jax[cuda12]` at the locked JAX version instead. Warp's locked wheel is a
+# CUDA 12 build and runs unchanged. The build fails if this step changes any package
+# that uv.lock installed.
+#
+# The source tree copied here is only used to create the editable install. At run time
+# the live checkout is bind-mounted over /workspace/newton-cosserat, so code changes
+# need no rebuild; rebuild only when uv.lock changes.
+
+Bootstrap: docker
+# Debian bookworm with git, curl and CA certificates (git fetches Newton/SoRoMoX and
+# records the benchmark revision).
+From: buildpack-deps:bookworm-scm
+
+%files
+    pyproject.toml /workspace/newton-cosserat/pyproject.toml
+    uv.lock /workspace/newton-cosserat/uv.lock
+    README.md /workspace/newton-cosserat/README.md
+    src /workspace/newton-cosserat/src
+
+%post -c /bin/bash
+    set -euo pipefail
+    UV_VERSION=0.12.3
+    PYTHON_VERSION=3.13
+    export UV_PYTHON_INSTALL_DIR=/opt/python UV_PYTHON_PREFERENCE=only-managed \
+        UV_PROJECT_ENVIRONMENT=/opt/venv VIRTUAL_ENV=/opt/venv \
+        UV_LINK_MODE=copy UV_COMPILE_BYTECODE=1 UV_NO_CACHE=1
+
+    curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" \
+        | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh
+    # The bind-mounted checkout may appear owned by another uid (e.g. on staff-umbrella).
+    git config --system --add safe.directory '*'
+
+    cd /workspace/newton-cosserat
+    rm -rf src/newton_cosserat.egg-info $(find src -name __pycache__ -type d)
+    uv python install "${PYTHON_VERSION}"
+
+    # 1. Locked dependencies (core + viz for result plots; no dev tools, no torch).
+    uv sync --locked --no-dev --no-install-project --extra viz --python "${PYTHON_VERSION}"
+
+    # 2. CUDA 12 JAX backend at the locked JAX version; refuse to modify locked packages.
+    uv pip freeze | sort > /opt/locked-freeze.txt
+    JAX_VERSION=$(/opt/venv/bin/python -c "import jax; print(jax.__version__)")
+    uv pip install "jax[cuda12]==${JAX_VERSION}"
+    uv pip freeze | sort > /opt/venv-freeze.txt
+    changed=$(comm -23 /opt/locked-freeze.txt /opt/venv-freeze.txt)
+    if [[ -n "${changed}" ]]; then echo "jax[cuda12] changed locked packages:"; echo "${changed}"; exit 1; fi
+    echo "Added for CUDA 12:"; comm -13 /opt/locked-freeze.txt /opt/venv-freeze.txt
+
+    # 3. Editable install of newton-cosserat pointing at /workspace/newton-cosserat/src.
+    uv sync --locked --no-dev --extra viz --inexact --python "${PYTHON_VERSION}"
+    uv pip freeze | sort > /opt/venv-freeze.txt
+    sha256sum uv.lock | cut -d' ' -f1 > /opt/uv.lock.sha256
+    # No GPU at build time: keep JAX off CUDA so the import check does not print plugin errors.
+    JAX_PLATFORMS=cpu /opt/venv/bin/python -c "import newton_cosserat.solvers, newton, warp, jax, soromox, matplotlib; print('imports ok')"
+
+%environment
+    export VIRTUAL_ENV=/opt/venv
+    export PATH=/opt/venv/bin:${PATH}
+    export XLA_PYTHON_CLIENT_PREALLOCATE=false
+    export PYTHONUNBUFFERED=1
+
+%runscript
+    exec python "$@"
+
+%help
+    newton-cosserat dependencies for DAIC (uv.lock with the viz extra, CUDA 12 JAX, no torch).
+    Run through daic/env.sh (nc_exec) from newton-cosserat-cluster. Installed packages: /opt/venv-freeze.txt.
